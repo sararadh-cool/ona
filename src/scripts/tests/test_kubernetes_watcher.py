@@ -14,9 +14,9 @@
 from __future__ import print_function, unicode_literals
 
 import io
-import json
 
 from os.path import join
+from json import load as json_load, dumps
 from shutil import rmtree
 from unittest import TestCase
 from urlparse import urlparse
@@ -25,7 +25,10 @@ from tempfile import mkdtemp
 import requests
 from mock import patch, MagicMock
 
-from ona_service.kubernetes_watcher import KubernetesWatcher
+from ona_service.kubernetes_watcher import (
+    DEFAULT_KUBERNETES_LABEL,
+    KubernetesWatcher,
+)
 
 PATCH_PATH = 'ona_service.kubernetes_watcher.{}'
 
@@ -35,151 +38,197 @@ GET_PODS_RESPONSE = {
     'apiVersion': 'v1',
     'metadata': {'selfLink': '/api/v1/pods/'},
     'items': [
-        # All good - default namespace
+        # The winner of the election
         {
-            'metadata': {'name': 'pod-01', 'namespace': 'default'},
-            'status': {'podIP': '192.0.2.1'},
-        },
-        # All good - custom namespace
-        {
-            'metadata': {'name': 'pod-02', 'namespace': 'custom'},
-            'status': {'podIP': '192.0.2.2'},
-        },
-        # Missing podIP
-        {
-            'metadata': {'name': 'pod-03', 'namespace': 'default'},
-            'status': {},
-        },
-        # Missing namespace
-        {
-            'metadata': {'name': 'pod-04'},
-            'status': {'podIP': '192.0.2.4'},
-        },
-        # Missing name
-        {
-            'metadata': {'namespace': 'bogus'},
-            'status': {'podIP': '192.0.2.5'},
-        },
-        # Host networking
-        {
-            'metadata': {'name': 'pod-06', 'namespace': 'default'},
+            'metadata': {'name': 'obsrvbl-ona-01', 'namespace': 'default'},
             'spec': {'nodeName': 'node-01', 'hostNetwork': True},
-            'status': {'podIP': '192.0.2.6'},
         },
-        # The kube-proxy
+        # The loser of the election
         {
-            'metadata': {
-                'name': 'kube-proxy-node-01', 'namespace': 'kube-system'
-            },
-            'spec': {'nodeName': 'node-01', 'hostNetwork': True},
-            'status': {'podIP': '192.0.2.6'},
+            'metadata': {'name': 'obsrvbl-ona-02', 'namespace': 'default'},
+            'spec': {'nodeName': 'node-02', 'hostNetwork': True},
+        },
+        # Missing node name, somehow
+        {
+            'metadata': {'name': 'obsrvbl-ona-03', 'namespace': 'default'},
+            'spec': {'hostNetwork': True},
+        },
+        # Missing spec, somehow
+        {
+            'metadata': {'name': 'obsrvbl-ona-04', 'namespace': 'default'},
         },
     ],
 }
 
 
-class HostnameResolverTest(TestCase):
+class KubernetesWatchers(TestCase):
     def setUp(self):
         self.tempdir = mkdtemp()
 
         self.k8s_ca_cert_path = join(self.tempdir, 'ca.crt')
         with io.open(self.k8s_ca_cert_path, 'wt') as outfile:
-            print('CA Certificate!', file=outfile)
+            print('CA Certificate!', file=outfile, end='')
 
         self.k8s_token_path = join(self.tempdir, 'token')
         with io.open(self.k8s_token_path, 'wt') as outfile:
-            print('Token!', file=outfile)
+            print('Token!', file=outfile, end='')
+
+        self.test_env = {
+            'KUBERNETES_SERVICE_HOST': '127.0.0.1',
+            'KUBERNETES_SERVICE_PORT': '8080',
+            'K8S_CA_CERT_PATH': self.k8s_ca_cert_path,
+            'KUBERNETES_TOKEN_PATH': self.k8s_token_path,
+        }
 
     def tearDown(self):
         rmtree(self.tempdir)
 
+    @patch(PATCH_PATH.format('get_hostname'), lambda: 'node-01')
     @patch(PATCH_PATH.format('requests.get'), autospec=True)
     def test_execute(self, mock_get):
         # Mock the API response, returning the test data
-        # Ensure that the hostname matches expecations
         def _get(url, params=None, **kwargs):
             from ona_service.kubernetes_watcher import requests as r
             host = urlparse(url).hostname
             r.packages.urllib3.connection.match_hostname({None: None}, host)
 
+            headers = kwargs['headers']
+            self.assertEqual(headers['Authorization'], 'Bearer Token!')
+            self.assertEqual(headers['Accept'], 'application/json')
+
             resp = requests.Response()
             resp.status_code = 200
-            resp._content = json.dumps(GET_PODS_RESPONSE)
+            resp.raw = io.BytesIO(dumps(GET_PODS_RESPONSE).encode('utf-8'))
             return resp
 
         mock_get.side_effect = _get
 
-        # Intercept the hostname upload, and check for expected output
+        # Intercept the upload, and check for expected output
         def _send_file(data_type, path, now, suffix=None):
-            self.assertEqual(data_type, 'hostnames')
+            self.assertEqual(data_type, 'logs')
             with open(path, 'rt') as infile:
-                actual = json.load(infile)
+                actual = json_load(infile)
 
-            expected = {
-                '192.0.2.1': 'pod-01.default',
-                '192.0.2.2': 'pod-02.custom',
-                '192.0.2.6': 'node-01',
-            }
-            self.assertEqual(actual, expected)
+            self.assertEqual(actual, GET_PODS_RESPONSE)
 
-            return 'file://{}/hostnames.json'.format(self.tempdir)
+            return 'file://{}/mock-ona_k8s-pods'.format(self.tempdir)
 
         # Emulate the k8s environment and run the service
-        env = {
-            'KUBERNETES_SERVICE_HOST': '127.0.0.1',
-            'KUBERNETES_SERVICE_PORT': '8080',
-            'K8S_CA_CERT_PATH': self.k8s_ca_cert_path,
-            'KUBERNETES_TOKEN_PATH': self.k8s_token_path,
-        }
-        with patch.dict(PATCH_PATH.format('os.environ'), env):
+        with patch.dict(PATCH_PATH.format('os.environ'), self.test_env):
             inst = KubernetesWatcher()
             inst.api = MagicMock(inst.api)
             inst.api.send_file.side_effect = _send_file
             inst.execute()
 
-        inst.api.send_signal.assert_called_once_with(
-            'hostnames',
-            {'path': 'file://{}/hostnames.json'.format(self.tempdir)}
+        # The first call should be filtered; the second shouldn't be filtered.
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(
+            mock_get.call_args_list[0][1].get('params'),
+            {'labelSelector': 'name={}'.format(DEFAULT_KUBERNETES_LABEL)},
+        )
+        self.assertEqual(
+            mock_get.call_args_list[1][1].get('params'),
+            None
         )
 
+        # The site signal should indicate the type and path
+        inst.api.send_signal.assert_called_once_with(
+            'logs',
+            {
+                'log_type': 'k8s-pods',
+                'path': 'file://{}/mock-ona_k8s-pods'.format(self.tempdir),
+            }
+        )
+
+    @patch(PATCH_PATH.format('get_hostname'), lambda: 'node-02')
     @patch(PATCH_PATH.format('requests.get'), autospec=True)
-    def test_execute_bad_status(self, mock_get):
-        # Mock the API response, returning an error
+    def test_should_not_execute(self, mock_get):
+        # When the hostname isn't the first, we shouldn't do any further
+        # querying.
+
+        # Mock the API response, returning the test data
         def _get(url, params=None, **kwargs):
+            from ona_service.kubernetes_watcher import requests as r
+            host = urlparse(url).hostname
+            r.packages.urllib3.connection.match_hostname({None: None}, host)
+
+            self.assertTrue(params)
+
             resp = requests.Response()
-            resp.status_code = 403
-            resp._content = json.dumps({})
+            resp.status_code = 200
+            resp.raw = io.BytesIO(dumps(GET_PODS_RESPONSE).encode('utf-8'))
             return resp
 
         mock_get.side_effect = _get
 
         # Emulate the k8s environment and run the service
-        env = {
-            'KUBERNETES_SERVICE_HOST': '127.0.0.1',
-            'KUBERNETES_SERVICE_PORT': '8080',
-            'K8S_CA_CERT_PATH': self.k8s_ca_cert_path,
-            'KUBERNETES_TOKEN_PATH': self.k8s_token_path,
-        }
-        with patch.dict(PATCH_PATH.format('os.environ'), env):
+        with patch.dict(PATCH_PATH.format('os.environ'), self.test_env):
             inst = KubernetesWatcher()
             inst.api = MagicMock(inst.api)
             inst.execute()
 
+        inst.api.send_file.assert_not_called()
+        inst.api.send_signal.assert_not_called()
+
+    @patch(PATCH_PATH.format('get_hostname'), lambda: 'node-01')
+    @patch(PATCH_PATH.format('requests.get'), autospec=True)
+    def test_execute_bad_check(self, mock_get):
+        # Mock the API response, returning an error
+        def _get(url, params=None, **kwargs):
+            resp = requests.Response()
+
+            resp.status_code = 403
+            resp.raw = io.BytesIO(dumps({}).encode('utf-8'))
+            return resp
+
+        mock_get.side_effect = _get
+
+        # Emulate the k8s environment and run the service
+        with patch.dict(PATCH_PATH.format('os.environ'), self.test_env):
+            inst = KubernetesWatcher()
+            inst.api = MagicMock(inst.api)
+            inst.execute()
+
+        # Since the initial check failed, no second GET should be made.
         # No Observable API calls should be made
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(inst.api.call_count, 0)
+
+    @patch(PATCH_PATH.format('get_hostname'), lambda: 'node-01')
+    @patch(PATCH_PATH.format('requests.get'), autospec=True)
+    def test_execute_bad_update(self, mock_get):
+        # Mock the API response, returning an error
+        def _get(url, params=None, **kwargs):
+            resp = requests.Response()
+
+            if params:
+                resp = requests.Response()
+                resp.status_code = 200
+                resp.raw = io.BytesIO(dumps(GET_PODS_RESPONSE).encode('utf-8'))
+            else:
+                resp.status_code = 403
+                resp.raw = io.BytesIO(dumps({}).encode('utf-8'))
+            return resp
+
+        mock_get.side_effect = _get
+
+        # Emulate the k8s environment and run the service
+        with patch.dict(PATCH_PATH.format('os.environ'), self.test_env):
+            inst = KubernetesWatcher()
+            inst.api = MagicMock(inst.api)
+            inst.execute()
+
+        # Since the initial check succeeded, a second GET should be made.
+        # No Observable API calls should be made
+        self.assertEqual(mock_get.call_count, 2)
         self.assertEqual(inst.api.call_count, 0)
 
     @patch(PATCH_PATH.format('requests.get'), autospec=True)
     def test_execute_missing_env(self, mock_get):
         # No API calls to Kubernetes or Observable should be made if there's
         # any missing environment variables
-        base_env = {
-            'KUBERNETES_SERVICE_HOST': '127.0.0.1',
-            'KUBERNETES_SERVICE_PORT': '8080',
-            'K8S_CA_CERT_PATH': self.k8s_ca_cert_path,
-            'KUBERNETES_TOKEN_PATH': self.k8s_token_path,
-        }
-        for key in base_env.iterkeys():
-            env = base_env.copy()
+        for key in self.test_env.iterkeys():
+            env = self.test_env.copy()
             env.pop(key)
             with patch.dict(PATCH_PATH.format('os.environ'), env):
                 inst = KubernetesWatcher()

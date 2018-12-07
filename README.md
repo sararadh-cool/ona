@@ -37,18 +37,14 @@ To install the latest version on 14.04 (recommended for physical and virtual mac
 
 ## Services
 
-The ONA is composed of a number of configurable services, supervised by a single system service, `obsrvbl-ona`. Control which services are running by editing `/opt/obsrvbl-ona/config`.
+The ONA is composed of a number of configurable services, supervised by a single system service, `obsrvbl-ona`.
+Control which services are running by editing `/opt/obsrvbl-ona/config.local`.
+Some of the services include:
 
-* (Runs by default) `obsrvbl-ona`: Monitors for configuration changes, handles
-  automatic updates. Starting this service will start the other services that are configured.
-* (Runs by default) `log-watcher`: Tracks the sensor's authentication logs.
-* (Runs by default) `pdns-capturer` - Collects passive DNS queries.
-* (Runs by default) `pna-monitor` - Collects IP traffic metadata.
-* (Runs by default) `pna-pusher` - Sends IP traffic metadata to the Observable cloud.
-* (Runs by default) `hostname-resolver` - Resolve active IPs to local hostnames.
-* `netflow-monitor` - Listens for NetFlow data sent by routers and switches.
-* `netflow-pusher` - Sends NetFlow data to the Observable cloud.
-* `notification-publisher` - Relays Observable observations and alerts over syslog or SNMP.
-* `ossec-alert-watcher` - If OSSEC is installed, monitors its alerts.
-* `suricata-alert-watcher` - If Suricata is installed, monitors its alerts.
+* __ONA Service__: Monitors for configuration updates
+* __PNA Service__ - Collects and uploads IP traffic metadata from system network interfaces
+* __IPFIX Capturer__ - Collects and uploads NetFlow, IPFIX, or sFlow data from remote exporters
+* __Hostname Resolver__ - Resolve active IPs to local hostnames
+* __Log watcher__: Monitors and uploads the sensor's authentication logs
+* __PDNS Capturer__ - Collects and uploads passive DNS queries
 

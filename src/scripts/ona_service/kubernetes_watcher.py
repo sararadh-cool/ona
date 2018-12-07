@@ -15,9 +15,9 @@ from __future__ import print_function, unicode_literals
 
 # python builtins
 import io
-import json
 import logging
 import os
+from platform import node as get_hostname
 from tempfile import NamedTemporaryFile
 
 # local
@@ -30,7 +30,10 @@ logging.basicConfig(level=logging.INFO, format=FORMAT)
 K8S_CA_CERT_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
 K8S_TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token'
 
-DATA_TYPE = 'hostnames'
+DATA_TYPE = 'logs'
+ENV_KUBERNETES_LABEL = 'OBSRVBL_KUBERNETES_LABEL'
+DEFAULT_KUBERNETES_LABEL = 'obsrvbl-ona'
+LOG_TYPE = 'k8s-pods'
 POLL_SECONDS = 3600
 
 
@@ -51,13 +54,16 @@ class KubernetesWatcher(Service):
         )
         self.k8s_token = self._read_if_exists(k8s_token_path)
 
+        # Label for the pods in the daemonset
+        self.k8s_label = os.environ.get(
+            ENV_KUBERNETES_LABEL, DEFAULT_KUBERNETES_LABEL
+        )
+
         self.match_hostname = (
             requests.packages.urllib3.connection.match_hostname
         )
 
-        kwargs.update({
-            'poll_seconds': POLL_SECONDS,
-        })
+        kwargs['poll_seconds'] = POLL_SECONDS
         super(KubernetesWatcher, self).__init__(*args, **kwargs)
 
     def _read_if_exists(self, *args, **kwargs):
@@ -69,54 +75,74 @@ class KubernetesWatcher(Service):
         except (IOError, OSError):
             return None
 
-    def _send_update(self, resolved, now):
-        with NamedTemporaryFile() as f:
-            f.write(json.dumps(resolved))
-            f.seek(0)
-            path = self.api.send_file(DATA_TYPE, f.name, now, suffix='hosts')
-            if path is not None:
-                data = {'path': path}
-                self.api.send_signal(DATA_TYPE, data)
-
-    def _get_pods(self):
-        # Hit the k8s API server for pods in all namespaces
-        url = 'https://{}:{}/api/v1/pods/'.format(self.k8s_host, self.k8s_port)
-        headers = {
+    def _get_headers(self):
+        return {
             'Authorization': 'Bearer {}'.format(self.k8s_token),
             'Accept': 'application/json',
         }
-        resp = requests.get(url, headers=headers, verify=self.k8s_ca_cert_path)
+
+    def _should_update(self):
+        # We query the Kubernetes API server to see what other instances
+        # of this service are running, using the `labelSelector` filter.
+        # If we're the first one in the list (lexicographically), we will
+        # continue on. Otherwise we'll go back to sleep and check later.
+        url = 'https://{}:{}/api/v1/pods/'.format(self.k8s_host, self.k8s_port)
+        params = {'labelSelector': 'name={}'.format(self.k8s_label)}
+        get_kwargs = {
+            'url': url,
+            'headers': self._get_headers(),
+            'params': params,
+            'verify': self.k8s_ca_cert_path,
+        }
+
+        # Make the request and parse the response
+        resp = requests.get(**get_kwargs)
         resp.raise_for_status()
         pod_data = resp.json()
 
-        pod_ip_map = {}
-        cluster_ip_map = {}
+        # Pull out the names of the nodes running this application
+        all_nodes = []
         for item in pod_data.get('items', []):
-            metadata = item.get('metadata', {})
-            pod_name = metadata.get('name')
-            pod_namespace = metadata.get('namespace')
-
-            status = item.get('status', {})
-            pod_ip = status.get('podIP')
-
             spec = item.get('spec', {})
-            host_network = spec.get('hostNetwork', False)
             node_name = spec.get('nodeName')
+            if node_name:
+                all_nodes.append(node_name)
 
-            # Skip incomplete entries
-            if (not pod_name) or (not pod_namespace) or (not pod_ip):
-                continue
+        # If we are the first one, we win the election
+        all_nodes.sort()
+        if all_nodes and (all_nodes[0] == get_hostname()):
+            return True
 
-            # For pods that share the node's address, report that address
-            if host_network:
-                if node_name:
-                    cluster_ip_map[pod_ip] = node_name
-            # Otherwise, report pod-name.pod-namespace
-            else:
-                pod_ip_map[pod_ip] = '{}.{}'.format(pod_name, pod_namespace)
+        return False
 
-        pod_ip_map.update(cluster_ip_map)
-        return pod_ip_map
+    def _send_update(self, now):
+        # Talk to the Kubernetes API server discovered from the environment
+        url = 'https://{}:{}/api/v1/pods/'.format(self.k8s_host, self.k8s_port)
+        get_kwargs = {
+            'url': url,
+            'headers': self._get_headers(),
+            'verify': self.k8s_ca_cert_path,
+            'stream': True,
+        }
+
+        # Make the request, streaming the response into a temporary file
+        with NamedTemporaryFile() as f, requests.get(**get_kwargs) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(1024):
+                if chunk:
+                    f.write(chunk)
+
+            # Push out the received data
+            f.seek(0)
+            remote_path = self.api.send_file(
+                DATA_TYPE, f.name, now, suffix=LOG_TYPE
+            )
+            if remote_path is not None:
+                data = {
+                    'path': remote_path,
+                    'log_type': LOG_TYPE,
+                }
+                self.api.send_signal(DATA_TYPE, data)
 
     def _set_hostname_match(self):
         # Ensure that the hostname validates. This is required for certain
@@ -147,17 +173,18 @@ class KubernetesWatcher(Service):
             return
 
         self._set_hostname_match()
+
         try:
-            resolved = self._get_pods()
+            should_update = self._should_update()
         except Exception:
-            logging.exception('Error getting pod data')
-            return
+            logging.exception('Error checking daemonset')
+            should_update = False
 
-        if not resolved:
-            logging.error('No mappings were found')
-            return
-
-        self._send_update(resolved, now)
+        if should_update:
+            try:
+                self._send_update(now)
+            except Exception:
+                logging.exception('Error updating pod data')
 
 
 if __name__ == '__main__':
